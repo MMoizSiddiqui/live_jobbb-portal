@@ -5,22 +5,40 @@ import os
 from datetime import datetime
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from sqlalchemy import or_, text
+from sqlalchemy import or_
+from urllib.parse import urlparse 
+
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+secret_key = os.environ.get('SECRET_KEY')
+if not secret_key:
+    # Use a per-process random key if not provided (avoids hardcoded secrets).
+    # For production, always set SECRET_KEY in the host environment.
+    secret_key = os.urandom(32)
+app.config['SECRET_KEY'] = secret_key
 app.config['JSON_AS_ASCII'] = False
 app.config['INSTANCE_PATH'] = os.path.dirname(os.path.abspath(__file__))  # Prevent instance folder creation
 
 # Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'job_portal.db')}"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+database_url = os.environ.get('DATABASE_URL')
+if database_url:
+    # Render/Railway often provide postgres via DATABASE_URL
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+else:
+    app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(DATA_DIR, 'job_portal.db')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # File upload settings
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
 ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx'}
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB max file size
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -44,6 +62,32 @@ def after_request(response):
         db.session.rollback()
         print(f"Error committing changes: {str(e)}")
     return response
+
+
+from urllib.parse import urlparse
+from flask import request, redirect, url_for
+
+def safe_redirect(url, fallback='/'):
+    if not url:
+        return redirect(fallback)
+
+    parsed = urlparse(url)
+
+    safe_url = None
+
+    # Allow clean relative paths
+    if parsed.scheme == '' and parsed.netloc == '' and url.startswith('/'):
+        safe_url = url
+
+    # Allow same host URLs
+    elif parsed.netloc == request.host:
+        safe_url = url
+
+    # Fallback if unsafe
+    if not safe_url:
+        safe_url = fallback
+
+    return redirect(safe_url)
 
 # Database Models
 class User(db.Model):
@@ -93,58 +137,6 @@ class Review(db.Model):
     rating = db.Column(db.Integer, nullable=False)
     comment = db.Column(db.Text, nullable=False)
     date = db.Column(db.DateTime, default=datetime.utcnow)
-
-# ---- Category helpers (DB-only tables via schema.sql) ----
-def parse_categories_input(raw_input: str):
-    if not raw_input:
-        return []
-    parts = [p.strip() for p in raw_input.split(',')]
-    return [p for p in parts if p]
-
-def upsert_category(name: str):
-    try:
-        # Try select id
-        result = db.session.execute(text("SELECT id FROM categories WHERE name = :name"), {"name": name}).fetchone()
-        if result:
-            return result[0]
-        # Insert new
-        db.session.execute(text("INSERT INTO categories(name) VALUES (:name)"), {"name": name})
-        result = db.session.execute(text("SELECT id FROM categories WHERE name = :name"), {"name": name}).fetchone()
-        return result[0] if result else None
-    except Exception as e:
-        print(f"Error upserting category '{name}': {str(e)}")
-        return None
-
-def set_job_categories(job_id: int, category_names):
-    try:
-        # Clear existing links
-        db.session.execute(text("DELETE FROM job_categories WHERE job_id = :job_id"), {"job_id": job_id})
-        # Insert new links
-        for name in category_names:
-            cat_id = upsert_category(name)
-            if cat_id is not None:
-                db.session.execute(
-                    text("INSERT OR IGNORE INTO job_categories(job_id, category_id) VALUES (:job_id, :cat_id)"),
-                    {"job_id": job_id, "cat_id": cat_id}
-                )
-        db.session.flush()
-    except Exception as e:
-        print(f"Error setting job categories for job {job_id}: {str(e)}")
-
-def get_job_categories_str(job_id: int) -> str:
-    try:
-        row = db.session.execute(
-            text(
-                "SELECT GROUP_CONCAT(c.name, ', ') AS categories "
-                "FROM job_categories jc JOIN categories c ON c.id = jc.category_id "
-                "WHERE jc.job_id = :job_id"
-            ),
-            {"job_id": job_id}
-        ).fetchone()
-        return row[0] if row and row[0] else ''
-    except Exception as e:
-        print(f"Error fetching categories for job {job_id}: {str(e)}")
-        return ''
 
 def init_db():
     """Initialize the database using schema.sql"""
@@ -356,12 +348,6 @@ def dashboard():
     if user.user_type == 'employer':
         try:
             jobs = list(get_employer_jobs(user_id))
-            # Attach categories string for table rendering
-            for j in jobs:
-                try:
-                    j.categories = get_job_categories_str(j.id)
-                except Exception:
-                    j.categories = ''
             return render_template('dashboard.html', jobs=jobs)
         except Exception as e:
             print(f"Error fetching employer jobs: {str(e)}")
@@ -399,50 +385,20 @@ def jobs():
         user_id = session.get('user_id')
         user_type = session.get('user_type')
         
-        # Get jobs, including optional category search
+        # Get all jobs
         if search_query:
-            base_jobs = Job.query.filter(
+            jobs_query = Job.query.filter(
                 or_(
                     Job.title.ilike(f'%{search_query}%'),
                     Job.company.ilike(f'%{search_query}%'),
                     Job.description.ilike(f'%{search_query}%'),
                     Job.location.ilike(f'%{search_query}%')
                 )
-            ).all()
-
-            # Also find job_ids by category name match
-            try:
-                category_job_rows = db.session.execute(
-                    text(
-                        "SELECT DISTINCT jc.job_id FROM job_categories jc "
-                        "JOIN categories c ON c.id = jc.category_id "
-                        "WHERE LOWER(c.name) LIKE :q"
-                    ),
-                    {"q": f"%{search_query.lower()}%"}
-                ).fetchall()
-                category_job_ids = {row[0] for row in category_job_rows}
-            except Exception:
-                category_job_ids = set()
-
-            cat_jobs = []
-            if category_job_ids:
-                cat_jobs = Job.query.filter(Job.id.in_(category_job_ids)).all()
-
-            # Merge and sort by created_at desc
-            merged = {job.id: job for job in base_jobs}
-            for j in cat_jobs:
-                merged[j.id] = j
-            jobs_query = sorted(merged.values(), key=lambda j: j.created_at or datetime.utcnow(), reverse=True)
+            ).order_by(Job.created_at.desc()).all()
         else:
             jobs_query = Job.query.order_by(Job.created_at.desc()).all()
         
         jobs = list(jobs_query)
-        # Attach categories for rendering
-        for j in jobs:
-            try:
-                j.categories = get_job_categories_str(j.id)
-            except Exception:
-                j.categories = ''
         
         # Get applied jobs for the current user if they're a job seeker
         applied_jobs = set()
@@ -576,14 +532,9 @@ def add_job():
     description = request.form['description']
     location = request.form['location']
     deadline = datetime.strptime(request.form['deadline'], '%Y-%m-%d').date()
-    categories_raw = request.form.get('categories', '').strip()
     
     try:
-        job = create_job(title, company, description, location, deadline, session['user_id'])
-        # Persist categories
-        category_names = parse_categories_input(categories_raw)
-        if category_names:
-            set_job_categories(job.id, category_names)
+        create_job(title, company, description, location, deadline, session['user_id'])
         print(f"New job posted: {title} by {company}")
         flash('Job posted successfully!', 'success')
     except Exception as e:
@@ -607,11 +558,6 @@ def update_job(job_id):
             return redirect(url_for('dashboard'))
 
         if request.method == 'GET':
-            # Attach categories string for template convenience
-            try:
-                job.categories = get_job_categories_str(job.id)
-            except Exception:
-                job.categories = ''
             return render_template('edit_job.html', job=job)
         
         # Handle POST request
@@ -632,11 +578,7 @@ def update_job(job_id):
         except ValueError:
             flash('Invalid date format', 'danger')
             return redirect(url_for('update_job', job_id=job_id))
-        # Categories
-        categories_raw = request.form.get('categories', '').strip()
-        category_names = parse_categories_input(categories_raw)
-        set_job_categories(job.id, category_names)
-
+        
         db.session.commit()
         flash('Job posting updated successfully', 'success')
         
@@ -718,32 +660,37 @@ def update_application_status(application_id):
         new_status = request.form.get('status')
         if new_status not in ['Pending', 'Accepted', 'Rejected']:
             flash('Invalid status value.', 'error')
-            return redirect(request.referrer)
+          
+            return safe_redirect(request.referrer, fallback=url_for('dashboard'))
 
         # Get the application
         application = Application.query.get(application_id)
         
         if not application:
             flash('Application not found.', 'error')
-            return redirect(request.referrer)
+         
+            return safe_redirect(request.referrer, fallback=url_for('dashboard'))
             
         # Check if user has permission (admin or employer of the job)
         job = get_job_by_id(application.job_id)
         if not (is_admin() or (session.get('user_type') == 'employer' and str(job.employer_id) == session.get('user_id'))):
             flash('You do not have permission to update this application.', 'error')
-            return redirect(request.referrer)
+           
+            return safe_redirect(request.referrer, fallback=url_for('dashboard'))
 
         # Update the application status
         application.status = new_status
         db.session.commit()
 
         flash(f'Application status updated to {new_status}.', 'success')
-        return redirect(request.referrer)
+        
+        return safe_redirect(request.referrer, fallback=url_for('dashboard'))
 
     except Exception as e:
         print(f"Error updating application status: {e}")
         flash('An error occurred while updating the application status.', 'error')
-        return redirect(request.referrer)
+       
+        return safe_redirect(request.referrer, fallback=url_for('dashboard'))
 
 @app.route('/view_cv/<filename>')
 def view_cv(filename):
@@ -971,11 +918,6 @@ def admin_edit_job(job_id):
             return redirect(url_for('view_database'))
 
         if request.method == 'GET':
-            # Attach categories for admin edit as well
-            try:
-                job.categories = get_job_categories_str(job.id)
-            except Exception:
-                job.categories = ''
             return render_template('edit_job.html', job=job, is_admin=True)
         
         # Handle POST request
@@ -994,11 +936,7 @@ def admin_edit_job(job_id):
         except ValueError:
             flash('Invalid date format', 'danger')
             return redirect(url_for('admin_edit_job', job_id=job_id))
-        # Categories
-        categories_raw = request.form.get('categories', '').strip()
-        category_names = parse_categories_input(categories_raw)
-        set_job_categories(job.id, category_names)
-
+        
         db.session.commit()
         flash('Job posting updated successfully', 'success')
         return redirect(url_for('view_database'))
@@ -1029,12 +967,18 @@ def admin_delete_review(review_id):
 def create_admin_user():
     """Create admin user if it doesn't exist"""
     try:
-        admin = get_user_by_email('admin@jobportal.com')
+        admin_email = os.environ.get('ADMIN_EMAIL')
+        admin_password = os.environ.get('ADMIN_PASSWORD')
+
+        if not admin_email or not admin_password:
+            return None
+
+        admin = get_user_by_email(admin_email)
         if not admin:
             admin = User(
                 name='Admin',
-                email='admin@jobportal.com',
-                password=generate_password_hash('admin123'),
+                email=admin_email,
+                password=generate_password_hash(admin_password),
                 user_type='admin',
                 is_admin=True,
                 created_at=datetime.utcnow()
@@ -1053,12 +997,7 @@ def is_admin():
     return session.get('user_id') and session.get('is_admin', False)
 
 if __name__ == '__main__':
-    app.run(debug=True) 
-
-
-
-#Email: admin@jobportal.com
-#Password: admin123
+    app.run(debug=False)  
 
 #ngrok config add-authtoken $YOUR_AUTHTOKEN     #get this from your ngrok account online
 #then on ngrok terminala on your host  run ngrok http $portnumber  #for example ngrok http 5000

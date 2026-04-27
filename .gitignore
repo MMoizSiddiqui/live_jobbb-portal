@@ -1,1 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+ssd_job-portal/job-portal/.venv/
+.cursor/
+
+# Local environment / secrets
+.env
+
+# Local DB + uploads (don’t commit user data)
+ssd_job-portal/job-portal/job_portal.db
+ssd_job-portal/job-portal/uploads/
+
 /ssd_job-portal.zip
